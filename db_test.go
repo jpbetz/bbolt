@@ -1,6 +1,7 @@
 package bolt_test
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -17,7 +18,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/coreos/bbolt"
+	bolt "github.com/coreos/bbolt"
 )
 
 var statsFlag = flag.Bool("stats", false, "show performance stats")
@@ -554,6 +555,107 @@ func TestOpen_RecoverFreeList(t *testing.T) {
 	freepages--
 	if fp := db.Stats().FreePageN; fp < freepages {
 		t.Fatalf("closed with %d free pages, opened with %d", freepages, fp)
+	}
+}
+
+func TestOpen_WriteToRecover(t *testing.T) {
+	// TODO: there seems to be a bug when initially opening with NoFreelistSync==true and then opening later with false
+	//o := &bolt.Options{NoFreelistSync: false}
+	o := &bolt.Options{}
+	db := MustOpenWithOption(o)
+	defer db.MustClose()
+
+	// Write some pages.
+	tx, err := db.Begin(true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wbuf := make([]byte, 8192)
+	for i := 0; i < 100; i++ {
+		s := fmt.Sprintf("%d", i)
+		b, err := tx.CreateBucket([]byte(s))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = b.Put([]byte(s), wbuf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Generate free pages.
+	if tx, err = db.Begin(true); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 50; i++ {
+		s := fmt.Sprintf("%d", i)
+		b := tx.Bucket([]byte(s))
+		if b == nil {
+			t.Fatal(err)
+		}
+		if err := b.Delete([]byte(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Record freelist count from opening with NoFreelistSync.
+	db.MustReopen()
+	fpn := db.Stats().FreePageN
+	//fids := db.freelist
+	if fpn == 0 {
+		t.Fatalf("no free pages on reopen")
+	}
+
+	// Write the db using WriteTo
+	if tx, err = db.Begin(false); err != nil {
+		t.Fatal(err)
+	}
+	snap := tempfile()
+	snapf, err := os.Create(snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := bufio.NewWriter(snapf)
+	if _, err := tx.WriteTo(w); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapf.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapdb, err := bolt.Open(snap, 0444, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapfpn := snapdb.Stats().FreePageN
+	//snapfids := snapdb.freelist
+
+	//t.Logf("orig ids: %v", fids)
+	//t.Logf("snap ids: %v", snapfids)
+
+	if snapfpn != fpn {
+		t.Fatalf("Tx.WriteTo copied db with %d free pages, copy re-opened with %d", fpn, snapfpn)
+	}
+
+	if err := snapdb.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
